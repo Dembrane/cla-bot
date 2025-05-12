@@ -13590,25 +13590,55 @@ async function run() {
     try {
         const githubToken = (0,core.getInput)("github-token");
         const contributorsFile = (0,core.getInput)("contributors-file");
-        // Determine pull request(s) to check, supporting both pull_request and merge_group events
-        const pullRequests = (() => {
-            if (github.context.payload.pull_request) {
-                return [github.context.payload.pull_request];
-            }
-            if (github.context.eventName === "merge_group" &&
-                Array.isArray(github.context.payload.merge_group?.pull_requests)) {
-                return github.context.payload.merge_group.pull_requests;
-            }
-            throw new Error("No pull request context available");
-        })();
         const octokit = (0,github.getOctokit)(githubToken);
-        // Fetch commits for all pull requests
-        const commitResults = await Promise.all(pullRequests.map((pr) => octokit.rest.pulls.listCommits({
-            owner: github.context.repo.owner,
-            repo: github.context.repo.repo,
-            pull_number: pr.number,
-        })));
-        const commits = commitResults.flatMap((res) => res.data);
+        // Determine commits and contributors, handling both pull_request and merge_group events
+        let commits = [];
+        let contributors = [];
+        if (github.context.payload.pull_request) {
+            // Single pull request event
+            const pr = github.context.payload.pull_request;
+            const { data: prCommits } = await octokit.rest.pulls.listCommits({
+                owner: github.context.repo.owner,
+                repo: github.context.repo.repo,
+                pull_number: pr.number,
+            });
+            commits = prCommits;
+            const { data: contentData } = await octokit.rest.repos.getContent({
+                owner: pr.head.repo.owner.login,
+                repo: pr.head.repo.name,
+                path: contributorsFile,
+                ref: pr.head.ref,
+            });
+            const contentFile = contentData;
+            const raw = contentFile.content;
+            const fileText = Buffer.from(raw, "base64").toString();
+            contributors = (load(fileText) ?? []);
+        }
+        else if (github.context.eventName === "merge_group") {
+            // Merge queue: compare commits between base and head_sha only
+            const mg = github.context.payload.merge_group;
+            const { data: compareData } = await octokit.rest.repos.compareCommits({
+                owner: github.context.repo.owner,
+                repo: github.context.repo.repo,
+                base: mg.base_sha,
+                head: mg.head_sha,
+            });
+            commits = compareData.commits;
+            // Load CONTRIBUTORS file at the merge-group temporary ref
+            const { data: contentData } = await octokit.rest.repos.getContent({
+                owner: github.context.repo.owner,
+                repo: github.context.repo.repo,
+                path: contributorsFile,
+                ref: mg.head_ref,
+            });
+            const contentFile = contentData;
+            const raw = contentFile.content;
+            const fileText = Buffer.from(raw, "base64").toString();
+            contributors = (load(fileText) ?? []);
+        }
+        else {
+            throw new Error("No pull request or merge group context available");
+        }
         // Check for commits without GitHub user
         const missingAuthors = commits.filter((commit) => !commit.author?.login);
         if (missingAuthors.length > 0) {
@@ -13618,19 +13648,6 @@ async function run() {
         const authors = Array.from(new Set(commits
             .filter((commit) => commit.author.type.toLowerCase() !== "bot")
             .map((commit) => commit.author.login))).sort();
-        // Fetch CONTRIBUTORS file from each PR head
-        const fileContentResponses = await Promise.all(pullRequests.map((pr) => octokit.rest.repos.getContent({
-            owner: pr.head.repo.owner.login,
-            repo: pr.head.repo.name,
-            path: contributorsFile,
-            ref: pr.head.ref,
-        })));
-        const contributors = fileContentResponses.flatMap((response) => {
-            const contentFile = response.data;
-            const raw = contentFile.content;
-            const content = Buffer.from(raw, "base64").toString();
-            return (load(content) ?? []);
-        });
         // Determine missing CLA signatures
         const missing = authors.filter((author) => !contributors.includes(author));
         if (missing.length > 0) {

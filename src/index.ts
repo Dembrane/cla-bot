@@ -8,33 +8,55 @@ async function run(): Promise<void> {
 		const githubToken = getInput("github-token");
 		const contributorsFile = getInput("contributors-file");
 
-		// Determine pull request(s) to check, supporting both pull_request and merge_group events
-		const pullRequests: Array<any> = (() => {
-			if (context.payload.pull_request) {
-				return [context.payload.pull_request];
-			}
-			if (
-				context.eventName === "merge_group" &&
-				Array.isArray((context.payload as any).merge_group?.pull_requests)
-			) {
-				return (context.payload as any).merge_group.pull_requests;
-			}
-			throw new Error("No pull request context available");
-		})();
-
 		const octokit = getOctokit(githubToken);
 
-		// Fetch commits for all pull requests
-		const commitResults = await Promise.all(
-			pullRequests.map((pr: any) =>
-				octokit.rest.pulls.listCommits({
-					owner: context.repo.owner,
-					repo: context.repo.repo,
-					pull_number: pr.number,
-				})
-			)
-		);
-		const commits: Array<any> = commitResults.flatMap((res: any) => res.data);
+		// Determine commits and contributors, handling both pull_request and merge_group events
+		let commits: any[] = [];
+		let contributors: string[] = [];
+		if (context.payload.pull_request) {
+			// Single pull request event
+			const pr = context.payload
+				.pull_request as components["schemas"]["pull-request"];
+			const { data: prCommits } = await octokit.rest.pulls.listCommits({
+				owner: context.repo.owner,
+				repo: context.repo.repo,
+				pull_number: pr.number,
+			});
+			commits = prCommits;
+			const { data: contentData } = await octokit.rest.repos.getContent({
+				owner: pr.head.repo!.owner.login,
+				repo: pr.head.repo!.name,
+				path: contributorsFile,
+				ref: pr.head.ref,
+			});
+			const contentFile = contentData as components["schemas"]["content-file"];
+			const raw = contentFile.content;
+			const fileText = Buffer.from(raw, "base64").toString();
+			contributors = (yaml.load(fileText) ?? []) as string[];
+		} else if (context.eventName === "merge_group") {
+			// Merge queue: compare commits between base and head_sha only
+			const mg = (context.payload as any).merge_group;
+			const { data: compareData } = await octokit.rest.repos.compareCommits({
+				owner: context.repo.owner,
+				repo: context.repo.repo,
+				base: mg.base_sha as string,
+				head: mg.head_sha as string,
+			});
+			commits = compareData.commits;
+			// Load CONTRIBUTORS file at the merge-group temporary ref
+			const { data: contentData } = await octokit.rest.repos.getContent({
+				owner: context.repo.owner,
+				repo: context.repo.repo,
+				path: contributorsFile,
+				ref: mg.head_ref as string,
+			});
+			const contentFile = contentData as components["schemas"]["content-file"];
+			const raw = contentFile.content;
+			const fileText = Buffer.from(raw, "base64").toString();
+			contributors = (yaml.load(fileText) ?? []) as string[];
+		} else {
+			throw new Error("No pull request or merge group context available");
+		}
 
 		// Check for commits without GitHub user
 		const missingAuthors = commits.filter(
@@ -52,27 +74,6 @@ async function run(): Promise<void> {
 					.map((commit: any) => commit.author!.login)
 			)
 		).sort();
-
-		// Fetch CONTRIBUTORS file from each PR head
-		const fileContentResponses = await Promise.all(
-			pullRequests.map((pr: any) =>
-				octokit.rest.repos.getContent({
-					owner: pr.head.repo.owner.login,
-					repo: pr.head.repo.name,
-					path: contributorsFile,
-					ref: pr.head.ref,
-				})
-			)
-		);
-		const contributors: string[] = fileContentResponses.flatMap(
-			(response: any) => {
-				const contentFile =
-					response.data as components["schemas"]["content-file"];
-				const raw = contentFile.content;
-				const content = Buffer.from(raw, "base64").toString();
-				return (yaml.load(content) ?? []) as string[];
-			}
-		);
 
 		// Determine missing CLA signatures
 		const missing: string[] = authors.filter(
